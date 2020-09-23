@@ -3,11 +3,16 @@ package main
 import (
 	"fmt"
 	"io/ioutil"
+	"net/http"
+	"os/signal"
+	"time"
 
 	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rikatz/kubepug/lib"
 	"github.com/rikatz/kubepug/pkg/formatter"
 	"github.com/sirupsen/logrus"
@@ -16,6 +21,10 @@ import (
 	"github.com/spf13/cobra"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
+)
+
+const (
+	defaultScrapeInterval = 5 * time.Minute
 )
 
 var (
@@ -36,6 +45,8 @@ var (
 	format            string
 	filename          string
 	inputFile         string
+	monitor           bool
+	scrapeInterval    time.Duration
 	logLevel          string
 
 	rootCmd = &cobra.Command{
@@ -47,6 +58,11 @@ var (
 		RunE:         runPug,
 		Version:      getVersion(),
 	}
+
+	deprecatedCounter = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Help: "Counter of deprocated or deleted APIs",
+		Name: "deprocated_apis_count",
+	}, []string{"group", "kind", "version", "name", "scope", "object_name", "namespace", "deleted", "deprocated"})
 )
 
 func getVersion() string {
@@ -58,13 +74,16 @@ func getVersion() string {
 
 func runPug(cmd *cobra.Command, args []string) error {
 	config := lib.Config{
-		K8sVersion:      k8sVersion,
-		ForceDownload:   forceDownload,
-		APIWalk:         apiWalk,
-		SwaggerDir:      swaggerDir,
-		ShowDescription: showDescription,
-		ConfigFlags:     kubernetesConfigFlags,
-		Input:           inputFile,
+		K8sVersion:       k8sVersion,
+		ForceDownload:    forceDownload,
+		APIWalk:          apiWalk,
+		SwaggerDir:       swaggerDir,
+		ShowDescription:  showDescription,
+		ConfigFlags:      kubernetesConfigFlags,
+		Input:            inputFile,
+		Monitor:          monitor,
+		DeprecatedMetric: deprecatedCounter,
+		ScrapeInterval:   scrapeInterval,
 	}
 
 	lvl, err := logrus.ParseLevel(logLevel)
@@ -84,6 +103,28 @@ func runPug(cmd *cobra.Command, args []string) error {
 	log.Debugf("Starting Kubepug with configs: %+v", config)
 	kubepug := lib.NewKubepug(config)
 
+	if config.Monitor {
+		done := make(chan os.Signal)
+		signal.Notify(done, os.Interrupt)
+		go func() {
+			http.Handle("/metrics", promhttp.Handler())
+			http.ListenAndServe("0.0.0.0:8888", nil)
+		}()
+
+		ticker := time.NewTicker(config.ScrapeInterval)
+		for {
+			select {
+			case <-done:
+				// cleanup
+			case <-ticker.C:
+				result, err := kubepug.GetDeprecated()
+				if err != nil {
+					return err
+				}
+				kubepug.MeasureResults(result, config.DeprecatedMetric)
+			}
+		}
+	}
 	result, err := kubepug.GetDeprecated()
 	if err != nil {
 		return err
@@ -118,6 +159,7 @@ func init() {
 		rootCmd.Example = cmdValue
 	}
 
+	// TODO(igaskin): change the kube client to support running intra-cluster
 	kubernetesConfigFlags = genericclioptions.NewConfigFlags(true)
 	kubernetesConfigFlags.AddFlags(rootCmd.Flags())
 
@@ -144,7 +186,11 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&format, "format", "stdout", "Format in which the list will be displayed [stdout, plain, json, yaml]")
 	rootCmd.PersistentFlags().StringVar(&filename, "filename", "", "Name of the file the results will be saved to, if empty it will display to stdout")
 	rootCmd.PersistentFlags().StringVar(&inputFile, "input-file", "", "Location of a file or directory containing k8s manifests to be analysed")
+	rootCmd.PersistentFlags().BoolVar(&monitor, "monitor", true, "run kubepug as a persistant prometheus server to monitor deprocations")
+	rootCmd.PersistentFlags().DurationVar(&scrapeInterval, "scrape-interval", defaultScrapeInterval, "Scrape interval to gather prometheus metrics")
 	rootCmd.PersistentFlags().StringVarP(&logLevel, "verbosity", "v", logrus.WarnLevel.String(), "Log level: debug, info, warn, error, fatal, panic")
+
+	prometheus.MustRegister(deprecatedCounter)
 }
 
 func main() {
@@ -152,4 +198,5 @@ func main() {
 		log.Errorf("An error has ocurred: %v", err)
 		os.Exit(1)
 	}
+	time.Sleep(100 * time.Hour)
 }

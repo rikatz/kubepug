@@ -14,11 +14,11 @@ type K8sInput struct {
 	K8sconfig *genericclioptions.ConfigFlags
 	K8sapi    parser.KubernetesAPIs
 	Apiwalk   bool
+	Monitor   bool
 }
 
 // ListDeprecated lists the deprecated objects from a Kubernetes cluster
 func (i K8sInput) ListDeprecated() (deprecatedapis []results.DeprecatedAPI) {
-
 	deprecatedapis = k8sinput.GetDeprecated(i.K8sapi, i.K8sconfig)
 	return deprecatedapis
 
